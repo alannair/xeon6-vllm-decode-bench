@@ -1,6 +1,6 @@
 # Xeon 6 vLLM CPU decode benchmark
 
-A reproducible, host-initiated benchmark of **vLLM on Intel Xeon 6 / Granite Rapids**, with Intel Xeon 6 model recipes, single-NUMA-node execution, closed-loop streaming clients, per-token timing, periodic vLLM `/metrics`, and 100 ms `perf` counter time series. Each individual run has a hard **28-minute watchdog (with cleanup budget under 30 minutes)** watchdog including model download, server launch, measurement, and cleanup.
+A reproducible, host-initiated benchmark of **vLLM on Intel Xeon 6 / Granite Rapids**, with Intel Xeon 6 model recipes, single-NUMA-node execution, closed-loop streaming clients, per-token timing, periodic vLLM `/metrics`, and 100 ms `perf` counter time series. Each individual run has a hard **28-minute watchdog (with cleanup budget under 30 minutes)** including model download, server launch, measurement, and cleanup.
 
 > **Validation note:** The Python controller, fake SSE client, sweep planner and parsers have unit/integration tests. Actual Xeon 6 AMX behaviour and platform IMC PMUs **must be verified on the target host**: this repository cannot simulate instruction execution or uncore PMU availability.
 
@@ -35,7 +35,7 @@ If you have only remote SSH access, use `./experiment.sh start` (background mode
 
 - Linux **x86_64**, Python >= 3.10, a supported `apt`/`dnf`/`yum` environment and privileges to install packages and use Docker.
 - Xeon 6 with AMX_TILE, AMX_BF16, AMX_INT8 and AVX-512 enabled in BIOS/OS for optimum performance. Setup records which flags are actually available; missing flags trigger a warning rather than a made-up AMX claim.
-- A **writable non-root mounted filesystem with at least 100 GiB free**, selected automatically from `/data`, `/data2`, `/scratch` and other real mounts by most available space. Or explicitly set `BENCH_DATA_DIR=/your/large/partition ./setup.sh`; an override can select a large root filesystem if intended. Setup fails instead of silently using `/` when no suitable disk is present.
+- A **writable data filesystem with at least 100 GiB free by default**, selected automatically from `/data`, `/data2`, `/scratch` and other real mounts by most available space. Or explicitly set `BENCH_DATA_DIR=/your/large/partition ./setup.sh`; an override can select a large root filesystem if intended. Setup fails instead of silently using `/` when no suitable disk is present. Set `MAX_HF_CACHE_SIZE_GB` before setup to allow smaller-than-100-GiB disks (subject to free-space safety thresholds).
 - ~32 GiB+ of physical memory on the selected NUMA node for small models, significantly more for 8B or 9B, depending on quantization and KV-cache allocation. The script reports NUMA memory size.
 - Working Docker daemon; **at least 10 GiB free in Docker's image-layer storage (larger CPU images may require much more)**. Hugging Face weights, Torch, vLLM, temp, XDG caches and `./logs` (a symlink) are placed on the selected data partition, *not* the root filesystem. If Docker's own data-root is cramped, move it before setup.
 - Permission for **system-wide `perf stat -a -C`** on the selected cores. Setup first tries unprivileged, then `sudo -n perf` and (with permission) tries `sysctl kernel.perf_event_paranoid=-1`. `perf` collection defaults to **required**; setup fails closed without at least cycles and instructions.
@@ -45,6 +45,21 @@ Setup installs missing `docker`, `numactl`, `perf`, `lscpu`/`util-linux`, and `c
 
 To reuse an already-pulled image (offline setup): `./setup.sh --no-pull`.
 
+### Optional bounded Hugging Face cache on small filesystems
+
+```bash
+export MAX_HF_CACHE_SIZE_GB=30
+export BENCH_DATA_DIR=/data  # optional override
+./setup.sh
+./experiment.sh start
+```
+
+The export is a positive number of **GiB** limiting the benchmark-owned Hugging Face cache, including model downloads and partial files. It is stored in `state/setup.json` so `resume` uses the same budget even when the shell variable is unset; exporting a different value requires re-running setup. With no cap, setup retains its >=100 GiB free-space default. With a cap, setup accepts smaller partitions subject to a safety floor. Only the private benchmark HF cache is counted: logs, Docker layers and other caches have separate disk usage.
+
+Before model loading, other model repositories in the private HF cache are evicted to avoid accumulating weights across models. A frequent background watcher stops the owned Docker container when cache use approaches the cap and discards oversized partial weights after shutdown. Infeasible models are skipped on subsequent configurations, with errors recorded in each attempt. CSV files report HF cache usage.
+
+**A polling watchdog is not a strict atomic disk quota**: a fast write can briefly exceed the limit. If the filesystem must *never* exceed the cap, use a dedicated size-limited filesystem or filesystem project quota for the private cache. Use `MAX_HF_CACHE_SIZE_GB` for best-effort bounded benchmarking, not as a substitute for a storage quota.
+
 ## Experimental design
 
 Default workloads are **32 prompt tokens** (actual tokenizer token IDs), **BF16** unless the model weights are already quantized, and **exactly N generated tokens** (both `min_tokens=N` and `max_tokens=N`, plus `ignore_eos=true`). Sending token IDs instead of natural-language text avoids tokenizer variability. Uses `/v1/completions` with `stream=true`, `return_token_ids=true` and `stream_options.include_usage=true`; server-side usage is kept in CSV for validation. A request failing to generate exactly N tokens is recorded as truncated/failed and excluded from **complete-request** latency-percentile summaries; their observed partial TTFT/TPOT remain in raw CSV and separate observed-sample summaries.
@@ -52,16 +67,16 @@ Default workloads are **32 prompt tokens** (actual tokenizer token IDs), **BF16*
 | Variable | Baseline | Swept values (one parameter at a time) |
 |---|---:|---|
 | Concurrent closed-loop clients | 8 | 1, 2, 4, 8, 16, 32, 64, 128 |
-| Physical inference cores | 32, capped by available cores | 4, 8, 16, 32, 48, 64, 96 (skip unavailable) |
+| Physical inference cores | **96 (required)** | **24, 48, 72, 96** (exact CPU IDs `0..N-1`) |
 | Output tokens/request | 512 | 128, 512, 2048 |
 | Input tokens/request | 32 | fixed |
 | Measurement duration | 90 s | fixed; up to 8 s drain then cancel unfinished |
 | Wall time per run | <=1680 s | enforced, *including first-download/startup* |
-| CPU and memory placement | 1 NUMA node | no cross-NUMA allocations by cpuset/mems |
+| CPU and memory placement | **NUMA node 0 only** | server `--cpuset-cpus=0..N-1`, `--cpuset-mems=0`; controller `numactl --membind=0` |
 
-Two physical cores are reserved on the **same NUMA node** for the controller/client/front-end; only the inference cores are given to OpenMP. If there are fewer cores than baseline, it is automatically reduced. SMT siblings are excluded for the default CPU set. All *model server* threads are limited by Docker `--cpuset-cpus` and all memory placement by Docker `--cpuset-mems`; thread binding uses `VLLM_CPU_OMP_THREADS_BIND` and `OMP_NUM_THREADS`. There may still be OS/interrupt traffic on the socket: this is not an isolated bare-metal environment.
+Each server run uses **exactly N physical CPU IDs `0..N-1`**, with memory allocations confined to NUMA node 0. Setup and planning fail if all 96 baseline CPU IDs are not distinct physical cores available on NUMA node 0; the baseline is never silently reduced. The host-side controller uses node-0 memory and prefers up to two spare node-0 housekeeping cores outside the server CPU set; it shares those CPUs when no spare cores exist. SMT siblings are excluded. This is not a fully isolated bare-metal environment.
 
-Default sweep plans are unique baseline + concurrency sweep + core sweep + output-token sweep, **not a Cartesian product**. Runs are sorted by model size. Example config ID: `node0_cores032_clients008_gen0512`.
+Default sweep plans are unique baseline + concurrency sweep + core sweep + output-token sweep, **not a Cartesian product**. Runs are sorted by model size. Example baseline config ID: `node0_cores096_clients008_gen0512`.
 
 ### Default models
 
@@ -89,7 +104,7 @@ Edit `configs/default.json` to change the models, sweep values, `server.extra_ar
 ./experiment.sh plan                               # preview on this host
 ./experiment.sh start --max-runs 1                 # quickest possible real smoke test
 ./experiment.sh start --models '*Qwen3-4B*' --sweeps baseline,cores
-./experiment.sh start --models '*w8a8*' --sweeps concurrency --numa-node 1
+./experiment.sh start --models '*w8a8*' --sweeps concurrency --numa-node 0
 ./experiment.sh start --foreground --max-runs 1    # see output directly
 ./experiment.sh stop
 ./experiment.sh resume
@@ -109,7 +124,7 @@ Each run writes into:
 ```
 logs/
   Qwen__Qwen3-4B/
-    node0_cores032_clients008_gen0512/
+    node0_cores096_clients008_gen0512/
       attempt-20261107T.../
         config.json                 # exact CPU/core placement, Docker command, image id, cache path
         recipe-config.yml / recipe-env.sh  # for recipe deployments
@@ -122,7 +137,7 @@ logs/
         token_events.csv           # every generated token ID and MONOTONIC receive time
         metrics.csv                # vLLM scheduler queue/running counts etc
         metrics_long.csv           # all vllm:* prometheus values/labels
-        storage.csv                # free/used capacity throughout load
+        storage.csv                # free/used capacity, HF cache usage, cap
         perf_core.stderr.txt       # original raw perf output
         perf_uncore.stderr.txt     # if IMC events discovered
         perf_events.csv            # every counter event by 100 ms interval
