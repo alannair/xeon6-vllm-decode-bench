@@ -15,7 +15,9 @@ import venv
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from bench.common import STATE, atomic_json, execute, format_bytes, free_bytes, utc_now
-from bench.topology import get_nodes
+from bench.cache import GIB, cache_size_bytes, evict_other_models, parse_cache_limit
+from bench.topology import choose_node, contiguous_node0_cores, get_nodes
+from bench.control import running_pid
 
 
 def find_data_root(required_gib: float) -> Path:
@@ -168,12 +170,23 @@ def check_perf(node: dict, attempted_sysctl: bool = False):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--no-pull", action="store_true")
-    p.add_argument("--min-free-gib", type=float, default=float(os.environ.get("BENCH_MIN_FREE_GIB", "100")))
+    p.add_argument("--min-free-gib", type=float, default=(float(os.environ["BENCH_MIN_FREE_GIB"])
+                   if "BENCH_MIN_FREE_GIB" in os.environ else None))
     args = p.parse_args()
     if sys.version_info < (3, 10) or platform.system() != "Linux" or platform.machine() != "x86_64":
         raise RuntimeError("Requires Linux x86_64 and Python >= 3.10")
+    if running_pid():
+        raise RuntimeError("Cannot rerun setup while experiments are running; ./experiment.sh stop first")
     config = json.loads((ROOT / "configs/default.json").read_text())
-    data_root = find_data_root(args.min_free_gib)
+    max_cache_bytes = parse_cache_limit(os.environ.get("MAX_HF_CACHE_SIZE_GB"))
+    cache_limit_gib = (max_cache_bytes / GIB) if max_cache_bytes is not None else None
+    # With a cap, allow data filesystems with <100 GiB free.
+    default_min_free = (100.0 if cache_limit_gib is None
+                        else max(8.0, min(16.0, cache_limit_gib / 2 + 4)))
+    required_free = args.min_free_gib if args.min_free_gib is not None else default_min_free
+    if required_free <= 0:
+        raise ValueError("--min-free-gib must be positive")
+    data_root = find_data_root(required_free)
     store = data_root / "xeon6-vllm-bench"
     store.mkdir(parents=True, exist_ok=True)
     for name in ("cache/huggingface", "cache/torch", "cache/vllm", "cache/xdg", "cache/tmp", "logs"):
@@ -194,8 +207,25 @@ def main():
     else:
         logs_link.symlink_to(target_logs, target_is_directory=True)
     print(f"Attempt logs: {logs_link} -> {target_logs}")
-    if free_bytes(store) < args.min_free_gib * 1024**3:
+    if free_bytes(store) < required_free * GIB:
         raise RuntimeError(f"Insufficient storage free after cache directory creation on {store}")
+    hf_home = store / "cache/huggingface"
+    cache_setup_evictions = None
+    if max_cache_bytes is not None:
+        # This is the benchmark's private HF_HOME; never delete external caches.
+        cache_setup_evictions = evict_other_models(hf_home, active_model=None)
+        if cache_size_bytes(hf_home) > max_cache_bytes:
+            raise RuntimeError("Other Hugging Face cache files exceed MAX_HF_CACHE_SIZE_GB even "
+                               "after evicting model repositories. Inspect " + str(hf_home))
+        print(f"HF cache cap: {cache_limit_gib:g} GiB; usage: "
+              f"{cache_size_bytes(hf_home) / GIB:.2f} GiB; "
+              f"evicted {len(cache_setup_evictions['removed_repositories'])} old model repos")
+    reserve_free = float(config["measurement"]["storage_min_free_gib"])
+    if cache_limit_gib is not None:
+        reserve_free = min(reserve_free, max(3.0, min(8.0, cache_limit_gib / 4)))
+    if free_bytes(store) < (reserve_free + 2) * GIB:
+        raise RuntimeError(f"Only {format_bytes(free_bytes(store))} free on {store}; "
+                           f"need > {reserve_free + 2:.1f} GiB to retain disk safety headroom")
     print(f"Model/cache storage: {store} ({format_bytes(free_bytes(store))} free)")
     maybe_install_missing()
     nodes = get_nodes()
@@ -204,7 +234,16 @@ def main():
               f"memory={node['memory_gib']} GiB")
     if not nodes:
         raise RuntimeError("No usable NUMA node found")
-    selected = max(nodes, key=lambda x: len(x["physical_cpus"]))
+    selected = choose_node(0)
+    available_cpus = contiguous_node0_cores(selected)
+    print(f"NUMA node 0: CPU IDs 0..{available_cpus-1} are schedulable distinct physical cores")
+    required_cores = max(int(config["sweeps"]["baseline_cores"]),
+                         *(int(n) for n in config["sweeps"]["cores"]))
+    if available_cpus < required_cores:
+        raise RuntimeError(f"The requested 96-core baseline/core sweep needs CPU IDs "
+                           f"0..{required_cores - 1} all on NUMA node 0 as distinct "
+                           f"physical cores; only 0..{available_cpus - 1} are available. "
+                           "Check lscpu -e / numactl --hardware / cpuset affinity")
     flags = set()
     for line in Path("/proc/cpuinfo").read_text().splitlines():
         if line.startswith("flags"):
@@ -235,7 +274,12 @@ def main():
                     "-r", str(ROOT / "requirements.txt")], check=True)
     atomic_json(STATE / "setup.json", {"setup_utc": utc_now(), "data_root": str(store),
                                        "node_snapshot": nodes, "isa": isa, "perf": perf_info,
-                                       "docker": docker_info, "onednn": onednn_info, "image": config["image"]})
+                                       "docker": docker_info, "onednn": onednn_info, "image": config["image"],
+                                       "max_hf_cache_size_bytes": max_cache_bytes,
+                                       "max_hf_cache_size_gib": cache_limit_gib,
+                                       "storage_min_free_gib": reserve_free,
+                                       "cache_setup_evictions": cache_setup_evictions,
+                                       "max_contiguous_node0_cpus": available_cpus})
     print("\nREADY: ./experiment.sh start")
     print("Data/cache:", store)
     print("Logs:", ROOT / "logs")
