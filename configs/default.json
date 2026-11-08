@@ -1,7 +1,7 @@
 {
   "image": "vllm/vllm-openai-cpu:latest-x86_64",
   "host_port": 18880,
-  "numa_node": "auto",
+  "numa_node": 0,
   "server": {
     "dtype": "bfloat16",
     "max_model_len": 4096,
@@ -64,7 +64,7 @@
   "sweeps": {
     "baseline_concurrency": 8,
     "baseline_output_tokens": 512,
-    "baseline_cores": 32,
+    "baseline_cores": 96,
     "concurrency": [
       1,
       2,
@@ -76,12 +76,9 @@
       128
     ],
     "cores": [
-      4,
-      8,
-      16,
-      32,
+      24,
       48,
-      64,
+      72,
       96
     ],
     "output_tokens": [
