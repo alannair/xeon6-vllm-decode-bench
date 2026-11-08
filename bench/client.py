@@ -246,6 +246,7 @@ async def run_measurement(base_url: str, model: str, out_dir: Path, data_dir: Pa
                           metrics_interval_s: float, storage_interval_s: float,
                           storage_min_free_gib: float, stopped,
                           hf_home: Path | None = None, max_hf_cache_size_bytes: int | None = None) -> dict:
+    request_file, request_writer = csv_writer(out_dir / "requests.csv", REQUEST_COLUMNS)
     token_file, token_writer = csv_writer(out_dir / "token_events.csv", TOKEN_COLUMNS, buffering=256*1024)
     phase_file, phase_writer = csv_writer(out_dir / "phases.csv", ["timestamp_utc", "monotonic_ns", "phase"])
     def mark(phase):
@@ -273,6 +274,7 @@ async def run_measurement(base_url: str, model: str, out_dir: Path, data_dir: Pa
             storage_task = asyncio.create_task(poll_storage(data_dir, storage_interval_s,
                                                              storage_min_free_gib, out_dir, stop_polling, failures,
                                                              hf_home, max_hf_cache_size_bytes))
+            mark("measurement_start")
             start = time.perf_counter()
             end = start + duration_s
             deadline_ns = time.perf_counter_ns() + int(duration_s * 1e9)
