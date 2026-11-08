@@ -81,7 +81,37 @@ def choose_node(spec="auto") -> dict:
     return max(nodes, key=lambda x: len(x["physical_cpus"]))
 
 
-def select_cores(node: dict, inference_cores: int, reserved: int = 2) -> dict:
+def contiguous_node0_cores(node: dict) -> int:
+    """Number of physical, schedulable CPU IDs 0,1,... on NUMA node 0.
+
+    Do not silently interpret N as 'the first N cores on node 0': Xeon systems
+    with SNC, SMT or container cpusets may use non-contiguous CPU numbering.
+    """
+    if node["node"] != 0:
+        raise ValueError("This experiment is restricted to NUMA node 0")
+    physical = set(node["physical_cpus"])
+    logical = set(node["logical_cpus"])
+    n = 0
+    while n in physical and n in logical:
+        n += 1
+    return n
+
+
+def select_cores(node: dict, inference_cores: int, reserved: int = 2,
+                 *, contiguous_from_zero: bool = False) -> dict:
+    if reserved < 0:
+        raise ValueError("reserved cores must be >= 0")
+    if contiguous_from_zero:
+        available = contiguous_node0_cores(node)
+        if inference_cores < 1 or inference_cores > available:
+            raise ValueError(f"Requested CPU IDs 0-{inference_cores-1}, but only IDs "
+                             f"0-{available-1} are accessible as distinct physical cores on NUMA node 0. "
+                             "Check numactl --hardware, lscpu -e and cgroup affinity.")
+        infer = list(range(inference_cores))
+        # Housekeeping, where possible, uses separate node-0 cores *outside*
+        # Docker's --cpuset-cpus. Server threads see exactly N CPUs, not N+2.
+        housekeeping = [cpu for cpu in node["physical_cpus"] if cpu not in infer][:reserved]
+        return {"infer": infer, "reserved": housekeeping, "all": infer}
     cpus = node["physical_cpus"]
     if len(cpus) < reserved + 1:
         raise ValueError(f"NUMA node {node['node']} has only {len(cpus)} accessible physical cores")
