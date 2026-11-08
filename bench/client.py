@@ -207,14 +207,13 @@ async def poll_metrics(session, base_url: str, interval: float, out_dir: Path, s
 
 
 async def poll_storage(data_dir: Path, interval: float, threshold_gib: float,
-                       out_dir: Path, stop: asyncio.Event, failures: list[str]):
                        out_dir: Path, stop: asyncio.Event, failures: list[str],
-                       hf_home: Path | None = None, max_hf_cache_size_bytes: int | None = None)
+                       hf_home: Path | None = None, max_hf_cache_size_bytes: int | None = None):
+    import shutil
     f, writer = csv_writer(out_dir / "storage.csv", STORAGE_COLUMNS)
     try:
         while not stop.is_set():
             stats = shutil.disk_usage(data_dir)
-            free_gib = stats.free / 1024**3
             free_gib = stats.free / GIB
             cache_bytes = cache_size_bytes(hf_home) if max_hf_cache_size_bytes is not None else None
             writer.writerow({"timestamp_utc": utc_now(), "free_gib": free_gib,
@@ -245,7 +244,6 @@ async def run_measurement(base_url: str, model: str, out_dir: Path, data_dir: Pa
                           duration_s: int, drain_s: int, request_timeout_s: int,
                           warmup_requests: int, warmup_output_tokens: int,
                           metrics_interval_s: float, storage_interval_s: float,
-                          storage_min_free_gib: float, stopped) -> dict:
                           storage_min_free_gib: float, stopped,
                           hf_home: Path | None = None, max_hf_cache_size_bytes: int | None = None) -> dict:
     token_file, token_writer = csv_writer(out_dir / "token_events.csv", TOKEN_COLUMNS, buffering=256*1024)
@@ -273,7 +271,6 @@ async def run_measurement(base_url: str, model: str, out_dir: Path, data_dir: Pa
             mark("warmup_end")
             metric_task = asyncio.create_task(poll_metrics(session, base_url, metrics_interval_s, out_dir, stop_polling))
             storage_task = asyncio.create_task(poll_storage(data_dir, storage_interval_s,
-                                                             storage_min_free_gib, out_dir, stop_polling, failures))
                                                              storage_min_free_gib, out_dir, stop_polling, failures,
                                                              hf_home, max_hf_cache_size_bytes))
             start = time.perf_counter()
