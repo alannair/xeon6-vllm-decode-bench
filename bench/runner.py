@@ -31,9 +31,9 @@ class RunTimeout(RuntimeError):
 
 def _on_signal(signum, frame):
     global STOP
-    STOP = True
     if signum == signal.SIGALRM:
         raise RunTimeout("Per-run wall time exceeded hard limit")
+    STOP = True
 
 
 def stopped():
