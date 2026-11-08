@@ -12,6 +12,7 @@ import sys
 import time
 
 from .common import LOGS, ROOT, STATE, atomic_json, read_json, timestamp_id, utc_now
+from .cache import parse_cache_limit
 from .plan import load_config, make_plan
 
 
@@ -39,6 +40,9 @@ def show_plan(plan):
     print(f"Plan {plan['plan_id']}: {len(plan['runs'])} runs, NUMA node {plan['node']['node']}, "
           f"socket {plan['node']['socket']}, {len(plan['node']['physical_cpus'])} physical cores")
     print("models:", ", ".join(plan["models"]))
+    print("CPU IDs for each core count: 0..N-1 (node 0); memory: NUMA node 0")
+    if plan.get("skipped_cpu_counts"):
+        print("WARNING: skipped unavailable node-0 core counts:", plan["skipped_cpu_counts"])
     for item in plan["runs"]:
         print(f"  {item['model']}  {item['config_id']}  [{item['sweep']}]")
 
@@ -49,7 +53,9 @@ def start_controller(plan, *, foreground=False):
     (STATE / "stop.flag").unlink(missing_ok=True)
     LOGS.mkdir(parents=True, exist_ok=True)
     log = LOGS / ("controller-" + timestamp_id() + ".log")
-    cmd = [str(ROOT / ".venv/bin/python"), "-m", "bench.runner"]
+    # Host-side Python clients and collectors must also allocate on node 0.
+    # Docker's --cpuset-mems=0 constrains the *server*, not this controller.
+    cmd = ["numactl", "--membind=0", str(ROOT / ".venv/bin/python"), "-m", "bench.runner"]
     if foreground:
         print("Foreground controller; Ctrl-C stops after cleanup.")
         proc = subprocess.Popen(cmd, cwd=ROOT)
@@ -121,10 +127,26 @@ def status():
         print(f"Remaining/not-successful: {total - counts['done']}")
     else:
         print("No plan yet: ./experiment.sh start")
+    setup = read_json(STATE / "setup.json")
+    if setup:
+        limit = setup.get("max_hf_cache_size_gib")
+        print("HF cache cap:", f"{limit:g} GiB" if limit is not None else "unlimited")
     info = read_json(STATE / "controller.json")
     if info:
         print("Controller log:", info.get("log"))
     return 0
+
+
+def verify_cache_limit(setup: dict) -> None:
+    """Prevent a changed shell export from silently invalidating saved setup.
+
+    The cap in setup.json is authoritative for start/resume, even when a new
+    shell no longer has the environment variable exported.
+    """
+    raw = os.environ.get("MAX_HF_CACHE_SIZE_GB")
+    if raw is not None and parse_cache_limit(raw) != setup.get("max_hf_cache_size_bytes"):
+        raise RuntimeError("MAX_HF_CACHE_SIZE_GB differs from setup. Rerun ./setup.sh "
+                           "to change the cache budget safely.")
 
 
 def main():
@@ -136,7 +158,7 @@ def main():
         p.add_argument("--config", type=Path, default=ROOT / "configs/default.json")
         p.add_argument("--models", help="Comma-separated model substrings or glob patterns")
         p.add_argument("--sweeps", help="Comma-separated: baseline,concurrency,cores,output_tokens")
-        p.add_argument("--numa-node", default=None, help="NUMA node ID (default auto)")
+        p.add_argument("--numa-node", default=None, help="Must be 0 (this experiment is node-0-only)")
         p.add_argument("--max-runs", type=int, help="Limit total runs, useful for smoke tests")
         if action == "start":
             p.add_argument("--foreground", action="store_true")
@@ -164,6 +186,7 @@ def main():
         setup = read_json(STATE / "setup.json")
         if not setup or not (ROOT / ".venv/bin/python").exists():
             raise RuntimeError("Setup not complete: run ./setup.sh")
+        verify_cache_limit(setup)
         if cfg["image"] != setup["image"]:
             raise RuntimeError("Configured image differs from setup image; rerun ./setup.sh with new config")
         STATE.mkdir(parents=True, exist_ok=True)
@@ -175,8 +198,10 @@ def main():
         plan = read_json(STATE / "plan.json")
         if not plan:
             raise RuntimeError("No saved plan found; run ./experiment.sh start")
-        if not read_json(STATE / "setup.json"):
+        setup = read_json(STATE / "setup.json")
+        if not setup:
             raise RuntimeError("Setup is missing; run ./setup.sh")
+        verify_cache_limit(setup)
         return start_controller(plan, foreground=args.foreground)
     return 1
 
