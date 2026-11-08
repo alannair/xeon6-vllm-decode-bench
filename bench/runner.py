@@ -16,6 +16,8 @@ import time
 import traceback
 
 from .client import run_measurement
+from .cache import (GIB, CacheQuotaGuard, cache_size_bytes, evict_active_model,
+                    evict_other_models)
 from .common import LOGS, ROOT, STATE, atomic_json, execute, free_bytes, read_json, timestamp_id, utc_now
 from .perf import PerfCollector
 from .topology import cpulist, select_cores
@@ -45,10 +47,11 @@ def safe_docker_name(plan_id: str, num: int):
 def docker_args(cfg: dict, run: dict, cache_dir: Path, cpus: dict, name: str,
                 kv_gb: int, output: Path | None = None) -> list[str]:
     server = cfg["server"]
-    # Container cpus/mems pin ALL server processes to the selected NUMA domain;
-    # OMP threads use the inference subset, reserving housekeeping cores for frontend.
+    # Server CPUs are exactly 0..N-1; only NUMA node 0 memory is permitted.
+    if run["numa_node"] != 0:
+        raise ValueError("Only NUMA node 0 is permitted")
     cmd = ["docker", "run", "--rm", "--name", name, "--network", "host",
-           "--cpuset-cpus", cpulist(cpus["all"]), "--cpuset-mems", str(run["numa_node"]),
+           "--cpuset-cpus", cpulist(cpus["infer"]), "--cpuset-mems", "0",
            "--shm-size", "4g", "--cap-add", "SYS_NICE", "--security-opt", "seccomp=unconfined",
            "-v", f"{cache_dir / 'cache/huggingface'}:/root/.cache/huggingface",
            "-v", f"{cache_dir / 'cache/torch'}:/cache/torch",
@@ -136,8 +139,12 @@ def check_port_available(port: int):
 def run_one(index: int, run: dict, plan: dict, setup: dict) -> dict:
     cfg = plan["config"]
     node = plan["node"]
-    caps = select_cores(node, run["cores"], int(cfg["limits"]["reserve_cores"]))
+    caps = select_cores(node, run["cores"], int(cfg["limits"]["reserve_cores"]),
+                        contiguous_from_zero=True)
     data_dir = Path(setup["data_root"])
+    hf_home = data_dir / "cache/huggingface"
+    cache_limit = setup.get("max_hf_cache_size_bytes")
+    min_free_gib = float(setup.get("storage_min_free_gib", cfg["measurement"]["storage_min_free_gib"]))
     output = LOGS / run["model_slug"] / run["config_id"] / ("attempt-" + timestamp_id())
     output.mkdir(parents=True, exist_ok=False)
     name = safe_docker_name(plan["plan_id"], index)
@@ -148,47 +155,66 @@ def run_one(index: int, run: dict, plan: dict, setup: dict) -> dict:
             "started": utc_now(), "plan_id": plan["plan_id"], "image_id": setup["docker"]["image_id"],
             "data_root": str(data_dir), "container_name": name, "cmd": cmd,
             "deployment": "recipe" if cfg["server"].get("deployment") == "recipe" and run.get("recipe") else "manual",
-            "perf_prefix": setup["perf"]["perf_prefix"]}
+            "perf_prefix": setup["perf"]["perf_prefix"],
+            "max_hf_cache_size_bytes": cache_limit, "storage_min_free_gib": min_free_gib,
+            "cpu_id_policy": "exact CPU IDs 0..N-1; memory node 0"}
     atomic_json(output / "config.json", meta)
     print(f"[{utc_now()}] START {index}: {run['model']} {run['config_id']} -> {output}", flush=True)
     result = {"run": run, "output": str(output), "status": "failed", "started": utc_now()}
     server_proc = None
     server_log = None
     perf = None
+    guard = None
     old_affinity = os.sched_getaffinity(0)
     start_time = time.monotonic()
     max_s = min(int(cfg["limits"]["run_timeout_s"]), 1680)
     try:
         if stopped():
             raise InterruptedError("Stopped before run start")
-        check_port_available(int(cfg["host_port"]))
         signal.setitimer(signal.ITIMER_REAL, max_s)
-        os.sched_setaffinity(0, caps["reserved"])
-        # Record storage continuously during potentially long model downloads.
-        if free_bytes(data_dir) < cfg["measurement"]["storage_min_free_gib"] * 1024**3:
+        if cache_limit is not None:
+            pruned = evict_other_models(hf_home, run["model"])
+            atomic_json(output / "cache_evictions.json", pruned)
+            if pruned["after_bytes"] > cache_limit:
+                raise RuntimeError("Existing active-model HF cache exceeds MAX_HF_CACHE_SIZE_GB")
+        check_port_available(int(cfg["host_port"]))
+        os.sched_setaffinity(0, caps["reserved"] or caps["infer"])
+        if free_bytes(data_dir) < min_free_gib * GIB:
             raise RuntimeError("Cache disk below storage_min_free_gib before container start")
+        if cache_limit is not None:
+            guard = CacheQuotaGuard(hf_home, cache_limit,
+                 on_violation=lambda: execute(["docker", "rm", "-f", name], timeout=10))
+            guard.start()
         server_log = (output / "server.log").open("w", encoding="utf-8", buffering=1)
         server_proc = subprocess.Popen(cmd, stdout=server_log, stderr=subprocess.STDOUT,
                                        text=True, start_new_session=True)
         atomic_json(STATE / "active_run.json", {"container": name, "output": str(output),
                                                     "model": run["model"], "pid": os.getpid()})
         from .common import csv_writer
-        sf, sw = csv_writer(output / "startup_storage.csv", ["timestamp_utc", "free_gib", "elapsed_s"])
+        sf, sw = csv_writer(output / "startup_storage.csv",
+                             ["timestamp_utc", "free_gib", "hf_cache_gib", "hf_cache_limit_gib", "elapsed_s"])
         try:
             deadline = time.monotonic() + min(int(cfg["limits"]["server_ready_timeout_s"]), max_s - 60)
             while time.monotonic() < deadline:
+                if guard and guard.error:
+                    raise RuntimeError(guard.error)
                 if stopped():
                     raise InterruptedError("Stopped during model startup")
                 if server_proc.poll() is not None:
                     raise RuntimeError(f"vLLM Docker process exited ({server_proc.returncode}); inspect server.log")
                 free = free_bytes(data_dir)
-                sw.writerow({"timestamp_utc": utc_now(), "free_gib": free / 1024**3,
+                hf_size = cache_size_bytes(hf_home) if cache_limit is not None else None
+                sw.writerow({"timestamp_utc": utc_now(), "free_gib": free / GIB,
+                             "hf_cache_gib": hf_size / GIB if hf_size is not None else "",
+                             "hf_cache_limit_gib": cache_limit / GIB if cache_limit is not None else "",
                              "elapsed_s": time.monotonic() - start_time})
-                if free / 1024**3 < cfg["measurement"]["storage_min_free_gib"]:
+                if cache_limit is not None and hf_size > cache_limit:
+                    raise RuntimeError("Model download exceeded MAX_HF_CACHE_SIZE_GB")
+                if free / GIB < min_free_gib:
                     raise RuntimeError("Model download aborted: disk space below safety threshold")
                 if execute(["curl", "--max-time", "2", "-fsS", base_url + "/health"], timeout=4).returncode == 0:
                     break
-                time.sleep(5)
+                time.sleep(1 if cache_limit is not None else 5)
             else:
                 raise RuntimeError("vLLM did not become healthy within server_ready_timeout_s; see server.log")
         finally:
@@ -212,14 +238,26 @@ def run_one(index: int, run: dict, plan: dict, setup: dict) -> dict:
                      warmup_requests=int(times["warmup_requests"]),
                      warmup_output_tokens=int(times["warmup_output_tokens"]),
                      metrics_interval_s=float(times["metrics_interval_s"]),
-                     storage_interval_s=float(times["storage_interval_s"]),
-                     storage_min_free_gib=float(times["storage_min_free_gib"]), stopped=stopped))
+                     storage_interval_s=min(1.0, float(times["storage_interval_s"]))
+                                      if cache_limit is not None else float(times["storage_interval_s"]),
+                     storage_min_free_gib=min_free_gib,
+                     stopped=lambda: stopped() or bool(guard and guard.error),
+                     hf_home=hf_home, max_hf_cache_size_bytes=cache_limit))
+        if guard and guard.error:
+            raise RuntimeError(guard.error)
         result.update({"status": "done", "summary": summary})
     except (InterruptedError, KeyboardInterrupt):
-        result.update({"status": "interrupted", "error": "Stopped by user"})
+        if guard and guard.error:
+            result.update({"status": "failed", "error": guard.error, "cache_infeasible": True})
+        else:
+            result.update({"status": "interrupted", "error": "Stopped by user"})
     except BaseException as exc:
         result.update({"status": "timeout" if isinstance(exc, RunTimeout) else "failed",
                        "error": str(exc), "traceback": traceback.format_exc()})
+        if guard and guard.error:
+            result.update({"status": "failed", "error": guard.error, "cache_infeasible": True})
+        elif "MAX_HF_CACHE_SIZE_GB" in str(exc):
+            result["cache_infeasible"] = True
         print(f"RUN FAILED: {run['model']} / {run['config_id']}: {exc}", flush=True)
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
@@ -238,8 +276,28 @@ def run_one(index: int, run: dict, plan: dict, setup: dict) -> dict:
                 server_proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 server_proc.kill()
+        if guard:
+            guard.stop()
+            if guard.error:
+                result.update({"status": "failed", "error": guard.error, "cache_infeasible": True})
         if server_log:
             server_log.close()
+        if cache_limit is not None:
+            try:
+                after = cache_size_bytes(hf_home)
+                result["hf_cache_bytes_after_run"] = after
+                if after > cache_limit or result.get("cache_infeasible"):
+                    result["cache_cleanup"] = evict_active_model(hf_home, run["model"])
+                    result["status"] = "failed"
+                    result["cache_infeasible"] = True
+                    result["error"] = (f"HF cache approached/exceeded MAX_HF_CACHE_SIZE_GB="
+                                       f"{cache_limit / GIB:g}; partial/oversized weights "
+                                       "removed after server exit")
+                    if result["cache_cleanup"]["after_bytes"] > cache_limit:
+                        result["error"] += "; other HF cache content still exceeds the cap"
+            except Exception as exc:
+                result["status"] = "failed"
+                result["cache_cleanup_error"] = str(exc)
         try:
             os.sched_setaffinity(0, old_affinity)
         except OSError:
@@ -268,17 +326,28 @@ def main():
     progress = read_json(STATE / "progress.json", {"plan_id": plan["plan_id"], "runs": {}})
     if progress["plan_id"] != plan["plan_id"]:
         raise RuntimeError("Plan/progress mismatch; refusing to resume stale experiments")
+    cache_infeasible_models = {
+        entry.get("run", {}).get("model") for entry in progress["runs"].values()
+        if entry.get("cache_infeasible")
+    }
     for idx, run in enumerate(plan["runs"]):
         if stopped():
             break
         key = run["model"] + "|" + run["config_id"]
-        if progress["runs"].get(key, {}).get("status") == "done":
+        if progress["runs"].get(key, {}).get("status") in ("done", "skipped_cache_limit"):
+            continue
+        if run["model"] in cache_infeasible_models:
+            progress["runs"][key] = {"run": run, "status": "skipped_cache_limit",
+                                     "error": "Model cannot fit within saved HF cache budget"}
+            atomic_json(STATE / "progress.json", progress)
             continue
         try:
             result = run_one(idx, run, plan, setup)
         except BaseException as exc:
             result = {"status": "failed", "error": str(exc), "run": run}
         progress["runs"][key] = result
+        if result.get("cache_infeasible"):
+            cache_infeasible_models.add(run["model"])
         atomic_json(STATE / "progress.json", progress)
         if result["status"] == "interrupted":
             break
