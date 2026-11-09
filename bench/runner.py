@@ -44,15 +44,31 @@ def safe_docker_name(plan_id: str, num: int):
     return f"xeon6-bench-{plan_id}-{num:03d}"
 
 
+def numactl_cpulist(cpus: list[int]) -> str:
+    if not cpus:
+        raise ValueError("CPU list is empty")
+    if cpus == list(range(cpus[0], cpus[-1] + 1)):
+        return str(cpus[0]) if len(cpus) == 1 else f"{cpus[0]}-{cpus[-1]}"
+    return cpulist(cpus)
+
+
 def docker_args(cfg: dict, run: dict, cache_dir: Path, cpus: dict, name: str,
                 kv_gb: int, output: Path | None = None) -> list[str]:
     server = cfg["server"]
     # Server CPUs are exactly 0..N-1; only NUMA node 0 memory is permitted.
     if run["numa_node"] != 0:
         raise ValueError("Only NUMA node 0 is permitted")
+    infer = cpus["infer"]
+    phys = numactl_cpulist(infer)
+    # OMP_PLACES=cores binds this image's libiomp to CPU 0. Importing torch then
+    # leaves the main thread on CPU 0, and a forked worker inherits that mask,
+    # so every OpenMP thread piles onto one core. numactl --physcpubind on the
+    # server, and vLLM --numa-bind on the worker (a fresh exec), restores the
+    # full set before OpenMP assigns thread i to CPU i.
     cmd = ["docker", "run", "--rm", "--name", name, "--network", "host",
-           "--cpuset-cpus", cpulist(cpus["infer"]), "--cpuset-mems", "0",
+           "--cpuset-cpus", phys, "--cpuset-mems", "0",
            "--shm-size", "4g", "--cap-add", "SYS_NICE", "--security-opt", "seccomp=unconfined",
+           "-v", f"{STATE / 'bin' / 'numactl'}:/usr/local/bin/numactl:ro",
            "-v", f"{cache_dir / 'cache/huggingface'}:/root/.cache/huggingface",
            "-v", f"{cache_dir / 'cache/torch'}:/cache/torch",
            "-v", f"{cache_dir / 'cache/vllm'}:/cache/vllm",
@@ -65,8 +81,12 @@ def docker_args(cfg: dict, run: dict, cache_dir: Path, cpus: dict, name: str,
         "HUGGINGFACE_HUB_CACHE": "/root/.cache/huggingface/hub",
         "TORCH_HOME": "/cache/torch", "VLLM_CACHE_ROOT": "/cache/vllm",
         "XDG_CACHE_HOME": "/cache/xdg", "TMPDIR": "/cache/tmp",
-        "VLLM_CPU_OMP_THREADS_BIND": cpulist(cpus["infer"]),
-        "OMP_NUM_THREADS": str(len(cpus["infer"])), "OMP_PROC_BIND": "close", "OMP_PLACES": "cores",
+        "VLLM_CPU_OMP_THREADS_BIND": phys,
+        "OMP_NUM_THREADS": str(len(infer)),
+        # Do not set KMP_AFFINITY here. On this image it pins the main thread
+        # to CPU 0, numactl then treats the other CPUs as out of range, and
+        # vLLM drops the worker binding. vLLM applies the proclist inside the
+        # worker, after numactl --physcpubind has given that process the full set.
         "KMP_BLOCKTIME": "0", "VLLM_CPU_KVCACHE_SPACE": str(kv_gb),
         "ONEDNN_VERBOSE": str(server.get("one_dnn_verbose", 0)),
         "DNNL_VERBOSE": str(server.get("one_dnn_verbose", 0)),
@@ -80,7 +100,9 @@ def docker_args(cfg: dict, run: dict, cache_dir: Path, cpus: dict, name: str,
                 "--dtype", server["dtype"], "--max-model-len", str(server["max_model_len"]),
                 "--max-num-seqs", str(server["max_num_seqs"]),
                 "--max-num-batched-tokens", str(server["max_num_batched_tokens"]),
-                "--tensor-parallel-size", "1"]
+                "--tensor-parallel-size", "1",
+                "--numa-bind", "--numa-bind-nodes", "0",
+                "--numa-bind-cpus", phys]
     cli_args.extend(server.get("extra_args", []))
     recipe = server.get("deployment", "manual") == "recipe" and run.get("recipe", False)
     if recipe:
@@ -93,17 +115,22 @@ def docker_args(cfg: dict, run: dict, cache_dir: Path, cpus: dict, name: str,
                       "--model", run["model"], "--hardware", "xeon6", "--detect-hardware",
                       "--config-out", "/benchout/recipe-config.yml",
                       "--env-out", "/benchout/recipe-env.sh"]
-        env_after_recipe = {"VLLM_CPU_OMP_THREADS_BIND": cpulist(cpus["infer"]),
-                            "OMP_NUM_THREADS": str(len(cpus["infer"])),
+        env_after_recipe = {"VLLM_CPU_OMP_THREADS_BIND": phys,
+                            "OMP_NUM_THREADS": str(len(infer)),
                             "VLLM_CPU_KVCACHE_SPACE": str(kv_gb)}
         exports = " ".join(f"{k}={shlex.quote(v)}" for k, v in env_after_recipe.items())
         shell = ("cd /vllm-workspace && " + shlex.join(python_cmd) +
-                 " && source /benchout/recipe-env.sh && export " + exports +
-                 " && exec vllm serve " + shlex.quote(run["model"]) +
+                 " && source /benchout/recipe-env.sh"
+                 " && unset OMP_PLACES OMP_PROC_BIND KMP_AFFINITY"
+                 " && export " + exports +
+                 " && exec /usr/local/bin/numactl --physcpubind=" + shlex.quote(phys) +
+                 " --membind=0 vllm serve " + shlex.quote(run["model"]) +
                  " --config /benchout/recipe-config.yml " + shlex.join(cli_args))
         cmd.extend(["--entrypoint", "/bin/bash", cfg["image"], "-lc", shell])
     else:
-        cmd.extend([cfg["image"], run["model"]] + cli_args)
+        cmd.extend(["--entrypoint", "/usr/local/bin/numactl", cfg["image"],
+                    "--physcpubind=" + phys, "--membind=0",
+                    "vllm", "serve", run["model"]] + cli_args)
     return cmd
 
 
@@ -130,6 +157,41 @@ def stop_container(name: str, timeout_s=10):
             raise RuntimeError(f"Unable to remove owned Docker container {name}: {removed.stderr[-300:]}")
 
 
+def ensure_numactl(image: str) -> Path:
+    """Cache a numactl binary built for the image's glibc.
+
+    The host numactl is too new to run inside the Ubuntu 22.04 vLLM image, and
+    the image ships libnuma but not the numactl program.
+    """
+    dest = STATE / "bin" / "numactl"
+    if dest.exists() and os.access(dest, os.X_OK) and dest.stat().st_size > 0:
+        return dest
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    script = ("apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq numactl"
+              " && cp -a /usr/bin/numactl /out/numactl && chmod 755 /out/numactl")
+    result = execute(["docker", "run", "--rm", "--entrypoint", "bash",
+                      "-v", f"{dest.parent}:/out", image, "-lc", script], timeout=180)
+    if result.returncode != 0 or not dest.exists():
+        raise RuntimeError("Could not install numactl from the vLLM image: "
+                           + (result.stderr or result.stdout)[-400:])
+    return dest
+
+
+def reclaim_cache_ownership(cache_root: Path, image: str) -> None:
+    """Re-own the private cache to the invoking user using the (local) server image.
+
+    Avoids sudo: the user is in the docker group, and the image already contains chown.
+    Failures are logged but do not abort the run; eviction reports its own error if it still can't delete.
+    """
+    uid, gid = os.getuid(), os.getgid()
+    if not cache_root.exists():
+        return
+    result = execute(["docker", "run", "--rm", "--network", "none", "--entrypoint", "chown",
+                      "-v", f"{cache_root}:/c", image, "-R", f"{uid}:{gid}", "/c"], timeout=300)
+    if result.returncode != 0:
+        print(f"WARNING: cache ownership reclaim failed: {result.stderr[-300:]}", flush=True)
+
+
 def check_port_available(port: int):
     with socket.socket() as sock:
         if sock.connect_ex(("127.0.0.1", port)) == 0:
@@ -149,6 +211,7 @@ def run_one(index: int, run: dict, plan: dict, setup: dict) -> dict:
     output.mkdir(parents=True, exist_ok=False)
     name = safe_docker_name(plan["plan_id"], index)
     kv_gb = kv_gb_for_node(cfg, node)
+    ensure_numactl(cfg["image"])
     cmd = docker_args(cfg, run, data_dir, caps, name, kv_gb, output)
     base_url = f"http://127.0.0.1:{cfg['host_port']}"
     meta = {"run": run, "node": node, "selected_cpus": caps, "kv_cache_gb": kv_gb,
@@ -173,6 +236,9 @@ def run_one(index: int, run: dict, plan: dict, setup: dict) -> dict:
             raise InterruptedError("Stopped before run start")
         signal.setitimer(signal.ITIMER_REAL, max_s)
         if cache_limit is not None:
+            # The container runs as root and writes root-owned blobs into the bind-mounted
+            # cache; re-own them first so eviction of older models can delete them.
+            reclaim_cache_ownership(data_dir / "cache", plan["config"]["image"])
             pruned = evict_other_models(hf_home, run["model"])
             atomic_json(output / "cache_evictions.json", pruned)
             if pruned["after_bytes"] > cache_limit:
