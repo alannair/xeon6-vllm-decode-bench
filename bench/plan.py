@@ -71,21 +71,32 @@ def make_plan(cfg: dict, model_patterns: list[str] | None = None, sweeps: list[s
         if model_patterns and not any(fnmatch.fnmatch(name, x) or fnmatch.fnmatch(name.split("/")[-1], x)
                                       or x in name for x in model_patterns):
             continue
+        cap = cfg.get("max_model_size_b")
+        if cap is not None and float(model.get("size_b", 0)) > float(cap):
+            continue
         selected.append(model)
     if not selected:
         raise ValueError("No enabled models match --models patterns")
-    selected.sort(key=lambda m: (float(m.get("size_b", 999)), m["id"]))
+    if all("queue_order" in m for m in selected):
+        # An explicit order (for example a random permutation, so an interrupted
+        # experiment still covers small and large models) replaces size ordering.
+        selected.sort(key=lambda m: (int(m["queue_order"]), m["id"]))
+    else:
+        selected.sort(key=lambda m: (float(m.get("size_b", 999)), m["id"]))
     runs = []
     # Each config varies only one independent variable relative to the baseline.
     for model in selected:
         for cores, concurrency, tokens, sweep in unique:
             cfg_id = f"node{node['node']}_cores{cores:03d}_clients{concurrency:03d}_gen{tokens:04d}"
-            runs.append({"model": model["id"], "size_b": model.get("size_b"),
-                         "model_slug": slug(model["id"].replace("/", "__")),
-                         "recipe": bool(model.get("recipe", False)),
-                         "config_id": cfg_id, "sweep": sweep, "numa_node": node["node"],
-                         "socket": node["socket"], "cores": cores, "concurrency": concurrency,
-                         "output_tokens": tokens})
+            entry = {"model": model["id"], "size_b": model.get("size_b"),
+                     "model_slug": slug(model["id"].replace("/", "__")),
+                     "recipe": bool(model.get("recipe", False)),
+                     "config_id": cfg_id, "sweep": sweep, "numa_node": node["node"],
+                     "socket": node["socket"], "cores": cores, "concurrency": concurrency,
+                     "output_tokens": tokens}
+            if "queue_order" in model:
+                entry["queue_order"] = int(model["queue_order"])
+            runs.append(entry)
     if max_runs is not None:
         runs = runs[:max_runs]
     if not runs:

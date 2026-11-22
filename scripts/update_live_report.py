@@ -432,6 +432,15 @@ def write_reports(rows, report_path: Path):
     lines.append("# vLLM decode latency report")
     lines.append("")
     lines.append(f"Live notes for plan `{plan.get('plan_id', 'unknown')}` on the Xeon 6972P node-0 benchmark. Updated {stamp}.")
+    remembered = read_json(STATE / "report_plans.json") or []
+    if len(remembered) > 1:
+        lines.append(
+            "Tables keep every finished pinned attempt from plans "
+            + ", ".join(f"`{item}`" for item in remembered)
+            + ". The progress count is the active plan. Sweeps match the pinned run: "
+            "concurrency 1, 2, 4, 8, 16, 32, 64, 128 at 96 cores, and cores 24, 48, 72, 96 at 8 clients. "
+            "Generated tokens stay at 512."
+        )
     lines.append("")
     lines.append("## Snapshot")
     lines.append("")
@@ -445,11 +454,14 @@ def write_reports(rows, report_path: Path):
     failed_runs = [item for item in progress.get("runs", {}).values() if item.get("status") == "failed"]
     if failed_runs and not pid:
         reason = (failed_runs[0].get("error") or "unknown").splitlines()[0][:160]
-        lines.append(
-            f"**Plan stopped early.** {len(failed_runs)} runs failed and the controller exited after the last one "
-            f"(`{reason}`). The cause is root-owned files in the private Hugging Face cache, written by the Docker container, "
-            f"which the cache-eviction step cannot delete. The 0.5B results above are valid. Nothing after them ran."
-        )
+        if "Permission denied" in reason or "root-owned" in reason:
+            lines.append(
+                f"**Plan stopped early.** {len(failed_runs)} runs failed and the controller exited after the last one "
+                f"(`{reason}`). The cause is root-owned files in the private Hugging Face cache, written by the Docker container, "
+                f"which the cache-eviction step cannot delete. The 0.5B results above are valid. Nothing after them ran."
+            )
+        else:
+            lines.append(f"**{len(failed_runs)} runs in the active plan failed.** First error: `{reason}`.")
         lines.append("")
     lines.append("Decode latency here is the time between generated tokens. The server series that records every token is `vllm:inter_token_latency_seconds`. The client series is the per-request mean TPOT, `(last token time − first token time) / (tokens − 1)`. Those two agree. vLLM's request-level `request_time_per_output_token_seconds` and `request_decode_time_seconds` update only when a request finishes. At ~350 ms/token a 512-token request cannot finish inside the 90-second window, so those histograms stay empty. They fill once the step is short enough that 512 tokens fit in the window.")
     lines.append("")
@@ -662,6 +674,10 @@ def write_reports(rows, report_path: Path):
     lines.append("KV-cache occupancy stays well under 0.1%. The waiting gauge stays at 0 through the finished concurrency points, so TTFT growth is service time inside the batch, not scheduler queue time. Queue-time histograms confirm that only if requests finish; they have not, inside the window.")
     lines.append("")
 
+    lines.append("## FP8 expectations")
+    lines.append("")
+    lines.append("This node's CPU flags list AMX tile, AMX BF16, and AMX INT8 (`amx_tile`, `amx_bf16`, `amx_int8`). There is no AMX FP8 unit. An FP8 checkpoint therefore does not get FP8 matrix math from AMX, and its weights are converted to a format the CPU kernels handle. Expect `Qwen/Qwen3-14B-FP8` to be no faster than the BF16 `Qwen/Qwen3-14B` row, and possibly slower because of that conversion. Its rows test whether the FP8 path runs on Xeon 6 and what it costs. They are not evidence of an FP8 speedup. The INT8 (`w8a8`) rows are the quantized comparison that uses AMX INT8.")
+    lines.append("")
     lines.append("## Caveats")
     lines.append("")
     n_complete = sum((r["client"]["complete"] or 0) for r in finished_rows)
@@ -749,6 +765,9 @@ def write_reports(rows, report_path: Path):
     status.append("## Current Phase")
     status.append("")
     status.append(f"{phase}.")
+    note = read_json(STATE / "continuation.json") or {}
+    if note.get("summary"):
+        status.append(note["summary"])
     if pid:
         status.append(f"Controller PID: {pid}. Start: {controller.get('started', 'unknown')}. Log: `{controller.get('log', '')}`.")
     if active.get("output"):
@@ -792,19 +811,61 @@ def write_reports(rows, report_path: Path):
     print(f"Updated {report_path.name} and status.md at {stamp}: {done}/{total} done, {len(finished_rows)} summaries, {len(partial_rows)} partial")
 
 
+def selected_plan_ids(args) -> set[str] | None:
+    path = STATE / "report_plans.json"
+    remembered = read_json(path) or []
+    if not isinstance(remembered, list):
+        remembered = []
+    ids = [str(item) for item in remembered if item]
+    if args.plan_id:
+        ids.extend(part.strip() for part in args.plan_id.split(",") if part.strip())
+    if args.remember_plans:
+        current = (read_json(STATE / "plan.json") or {}).get("plan_id")
+        if current:
+            ids.append(str(current))
+        merged = []
+        for item in ids:
+            if item not in merged:
+                merged.append(item)
+        path.write_text(json.dumps(merged, indent=2) + "\n")
+        ids = merged
+    if not ids:
+        return None
+    return set(ids)
+
+
+def latest_attempt(rows: list[dict]) -> list[dict]:
+    """One row per model and config. A finished attempt wins over a later failure."""
+    best: dict[tuple, dict] = {}
+    for row in rows:
+        key = (row.get("model"), row.get("config_id"))
+        prev = best.get(key)
+        rank = (1 if row.get("status") == "done" else 0, row["attempt"].name)
+        if prev is None:
+            best[key] = row
+            continue
+        prev_rank = (1 if prev.get("status") == "done" else 0, prev["attempt"].name)
+        if rank > prev_rank:
+            best[key] = row
+    return list(best.values())
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--plan-id", help="Keep attempts whose config.json plan_id matches")
+    parser.add_argument("--plan-id", help="Comma-separated plan ids to keep")
+    parser.add_argument("--remember-plans", action="store_true",
+                        help="Union --plan-id with state/report_plans.json and the saved plan, then filter to that set")
     parser.add_argument("--output", type=Path, default=ROOT / "REPORT.md")
     args = parser.parse_args()
+    allowed = selected_plan_ids(args)
     rows = []
     for path in sorted(LOGS.glob("*/*/attempt-*")):
         row = analyze_attempt(path)
-        if args.plan_id and row.get("plan_id") != args.plan_id:
+        if allowed is not None and row.get("plan_id") not in allowed:
             continue
         rows.append(row)
-    write_reports(rows, args.output)
+    write_reports(latest_attempt(rows), args.output)
 
 
 if __name__ == "__main__":

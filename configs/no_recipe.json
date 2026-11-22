@@ -1,0 +1,186 @@
+{
+  "image": "vllm/vllm-openai-cpu:latest-x86_64",
+  "host_port": 18880,
+  "numa_node": 0,
+  "max_model_size_b": 33,
+  "server": {
+    "dtype": "bfloat16",
+    "max_model_len": 4096,
+    "max_num_seqs": 128,
+    "max_num_batched_tokens": 4096,
+    "kv_cache_gb": "auto",
+    "one_dnn_verbose": 0,
+    "vllm_cpu_sgl_kernel": 0,
+    "extra_args": [],
+    "deployment": "manual"
+  },
+  "models": [
+    {
+      "id": "Qwen/Qwen3-0.6B",
+      "size_b": 0.75,
+      "recipe": false,
+      "queue_order": 13
+    },
+    {
+      "id": "deepseek-ai/deepseek-coder-1.3b-instruct",
+      "size_b": 1.35,
+      "recipe": false,
+      "queue_order": 18
+    },
+    {
+      "id": "Qwen/Qwen2.5-1.5B-Instruct",
+      "size_b": 1.54,
+      "recipe": false,
+      "queue_order": 7
+    },
+    {
+      "id": "HuggingFaceTB/SmolLM2-1.7B-Instruct",
+      "size_b": 1.71,
+      "recipe": false,
+      "queue_order": 4
+    },
+    {
+      "id": "ibm-granite/granite-3.3-2b-instruct",
+      "size_b": 2.53,
+      "recipe": false,
+      "queue_order": 8
+    },
+    {
+      "id": "Qwen/Qwen2.5-3B-Instruct",
+      "size_b": 3.09,
+      "recipe": false,
+      "queue_order": 5
+    },
+    {
+      "id": "microsoft/Phi-4-mini-instruct",
+      "size_b": 3.84,
+      "recipe": false,
+      "queue_order": 14
+    },
+    {
+      "id": "Qwen/Qwen3-4B-Instruct-2507",
+      "size_b": 4.02,
+      "recipe": false,
+      "queue_order": 11
+    },
+    {
+      "id": "HuggingFaceH4/zephyr-7b-beta",
+      "size_b": 7.24,
+      "recipe": false,
+      "queue_order": 10
+    },
+    {
+      "id": "allenai/OLMo-2-1124-7B-Instruct",
+      "size_b": 7.3,
+      "recipe": false,
+      "queue_order": 15
+    },
+    {
+      "id": "Qwen/Qwen2.5-7B-Instruct",
+      "size_b": 7.62,
+      "recipe": false,
+      "queue_order": 20
+    },
+    {
+      "id": "ibm-granite/granite-3.3-8b-instruct",
+      "size_b": 8.17,
+      "recipe": false,
+      "queue_order": 16
+    },
+    {
+      "id": "01-ai/Yi-1.5-9B-Chat",
+      "size_b": 8.83,
+      "recipe": false,
+      "queue_order": 1
+    },
+    {
+      "id": "allenai/OLMo-2-1124-13B-Instruct",
+      "size_b": 13.72,
+      "recipe": false,
+      "queue_order": 2
+    },
+    {
+      "id": "microsoft/phi-4",
+      "size_b": 14.66,
+      "recipe": false,
+      "queue_order": 19
+    },
+    {
+      "id": "Qwen/Qwen2.5-14B-Instruct",
+      "size_b": 14.77,
+      "recipe": false,
+      "queue_order": 3
+    },
+    {
+      "id": "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",
+      "size_b": 14.77,
+      "recipe": false,
+      "queue_order": 12
+    },
+    {
+      "id": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+      "size_b": 30.53,
+      "recipe": false,
+      "queue_order": 9
+    },
+    {
+      "id": "allenai/OLMo-2-0325-32B-Instruct",
+      "size_b": 32.23,
+      "recipe": false,
+      "queue_order": 6
+    },
+    {
+      "id": "Qwen/Qwen3-32B",
+      "size_b": 32.76,
+      "recipe": false,
+      "queue_order": 17
+    }
+  ],
+  "sweeps": {
+    "baseline_concurrency": 8,
+    "baseline_output_tokens": 512,
+    "baseline_cores": 96,
+    "concurrency": [
+      1,
+      2,
+      4,
+      8,
+      16,
+      32,
+      64,
+      128
+    ],
+    "cores": [
+      24,
+      48,
+      72,
+      96
+    ],
+    "output_tokens": [
+      128,
+      512,
+      2048
+    ]
+  },
+  "measurement": {
+    "prompt_tokens": 32,
+    "warmup_requests": 2,
+    "warmup_output_tokens": 16,
+    "duration_s": 90,
+    "drain_s": 8,
+    "request_timeout_s": 900,
+    "metrics_interval_s": 1,
+    "perf_interval_ms": 100,
+    "storage_interval_s": 5,
+    "storage_min_free_gib": 12,
+    "memory_cas_bytes": 64,
+    "require_perf": true
+  },
+  "limits": {
+    "run_timeout_s": 1680,
+    "server_ready_timeout_s": 1450,
+    "server_stop_timeout_s": 10,
+    "reserve_cores": 2
+  },
+  "queue_seed": 20261121
+}

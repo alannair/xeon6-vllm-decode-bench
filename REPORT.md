@@ -1,6 +1,6 @@
 # vLLM decode latency report
 
-Live notes for plan `5226854cadfd` on the Xeon 6972P node-0 benchmark. Updated 2026-11-09 14:02:56 UTC.
+Live notes for plan `5226854cadfd` on the Xeon 6972P node-0 benchmark. Updated 2026-11-11 15:05:41 UTC.
 
 ## Snapshot
 

@@ -43,6 +43,32 @@ class PlanningTests(unittest.TestCase):
         self.assertEqual([r['size_b'] for r in first['runs']],
                          sorted(r['size_b'] for r in first['runs']))
 
+    def test_max_model_size_drops_larger_models(self):
+        cfg = load_config()
+        cfg["max_model_size_b"] = 33
+        cfg["models"] = list(cfg["models"]) + [
+            {"id": "meta-llama/Llama-3.3-70B-Instruct", "size_b": 70.0, "recipe": True}]
+        with mock.patch('bench.plan.choose_node', return_value=NODE0):
+            plan = make_plan(cfg, None, ['baseline'])
+        self.assertEqual(len(plan['runs']), 8)
+        self.assertNotIn('meta-llama/Llama-3.3-70B-Instruct', plan['models'])
+
+    def test_queue_order_overrides_size_order(self):
+        cfg = load_config()
+        cfg["models"] = [
+            {"id": "a/small", "size_b": 1.0, "queue_order": 2},
+            {"id": "b/large", "size_b": 30.0, "queue_order": 1},
+            {"id": "c/mid", "size_b": 8.0, "queue_order": 3},
+        ]
+        with mock.patch('bench.plan.choose_node', return_value=NODE0):
+            plan = make_plan(cfg, None, ['baseline'])
+        self.assertEqual(plan['models'], ['b/large', 'a/small', 'c/mid'])
+        self.assertEqual([r['queue_order'] for r in plan['runs']], [1, 2, 3])
+        cfg["models"][0].pop("queue_order")
+        with mock.patch('bench.plan.choose_node', return_value=NODE0):
+            plan = make_plan(cfg, None, ['baseline'])
+        self.assertEqual(plan['models'], ['a/small', 'c/mid', 'b/large'])
+
     def test_strict_node0_baseline(self):
         cfg = load_config()
         fewer = {**NODE0, 'physical_cpus': list(range(72)), 'logical_cpus': list(range(72))}
